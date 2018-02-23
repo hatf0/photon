@@ -5,7 +5,6 @@ version(Windows):
 import core.sys.windows.core;
 import core.sys.windows.winsock2;
 import core.atomic;
-import core.internal.spinlock;
 import core.stdc.stdio;
 import core.stdc.stdlib;
 import core.thread;
@@ -181,7 +180,6 @@ static struct IoState
 
 struct SchedulerBlock
 {
-    AlignedSpinLock lock; // lock around the queue
     UMS_COMPLETION_LIST* completionList;
     RingQueue!(UMS_CONTEXT*) queue; // queue has the number of outstanding threads
     shared uint assigned; // total assigned UMS threads (counter, accessible everywhere)
@@ -197,7 +195,6 @@ struct SchedulerBlock
 
     this(int size)
     {
-        lock = AlignedSpinLock(SpinLock.Contention.brief);
         queue = RingQueue!(UMS_CONTEXT*)(size);
         wenforce(CreateUmsCompletionList(&completionList), "failed to create UMS completion");
         wenforce(GetUmsCompletionListEvent(completionList, &event), "failed to get event for UMS queue");
@@ -329,12 +326,9 @@ extern(Windows) VOID umsScheduler(UMS_SCHEDULER_REASON Reason, ULONG_PTR Activat
     if (Reason == 2) {
         IoState* state = cast(IoState*)SchedulerParam;
         auto ctx = cast(UMS_CONTEXT*)ActivationPayload;
-        logf("Got yield, schedNum: %d state = %s"w, schedNum, *state);
+        logf("Got yield, ctx = %x schedNum: %d state = %s", ctx, schedNum, *state);
         if (state.result != int.min) { // I/O already processed
-            sched.lock.lock();
-            auto queue = &sched.queue;
-            queue.push(ctx);
-            sched.lock.unlock();
+            ExecuteUmsThread(ctx);
         }
         else
             state.ctx = ctx;
@@ -348,7 +342,6 @@ extern(Windows) VOID umsScheduler(UMS_SCHEDULER_REASON Reason, ULONG_PTR Activat
         logf("Failed to dequeue ums workers!"w);
         return;
       }
-      sched.lock.lock();
       auto queue = &sched.queue; // struct, so take a ref
       while (ready != null)
       {
@@ -356,7 +349,6 @@ extern(Windows) VOID umsScheduler(UMS_SCHEDULER_REASON Reason, ULONG_PTR Activat
           queue.push(ready);
           ready = GetNextUmsListItem(ready);
       }
-      sched.lock.unlock();
       while(!queue.empty)
       {
         UMS_CONTEXT* ctx = queue.pop;
@@ -378,7 +370,7 @@ extern(Windows) VOID umsScheduler(UMS_SCHEDULER_REASON Reason, ULONG_PTR Activat
             }
             else
             {
-                logf("Failed to execute thread: %d"w, GetLastError());
+                logf("Failed to execute thread %x: %d", ctx, GetLastError());
                 return;
             }
         }
@@ -398,21 +390,18 @@ extern(Windows) VOID umsScheduler(UMS_SCHEDULER_REASON Reason, ULONG_PTR Activat
       }
       auto wait = WaitForMultipleObjects(2, sched.handles.ptr, FALSE, INFINITE);
       if (wait == WAIT_OBJECT_0) {
-        for (;;) {
-            OVERLAPPED_ENTRY[100] entries;
-            uint count = 0;
-            GetQueuedCompletionStatusEx(sched.completionPort, entries.ptr, 100, &count, 0, FALSE);
+        OVERLAPPED_ENTRY[100] entries = void;
+        uint count = 0;
+        while(GetQueuedCompletionStatusEx(sched.completionPort, entries.ptr, 100, &count, 0, FALSE)) {
             logf("Dequeued I/O schedNum=%d events=%d", schedNum, count);
-            sched.lock.lock();
             foreach (e; entries[0..count]) {
                 size_t key = cast(size_t)e.lpCompletionKey;
                 auto state = key in sched.ioWaiters;
                 state.result = cast(int)e.dwNumberOfBytesTransferred;
-                if (state.ctx) { // got into yield before the check
+                if (state.ctx) { // got into yield before I/O completed
                     queue.push(state.ctx);
                 }
             }
-            sched.lock.unlock();
             if (count < 100) break;
         }
       }
@@ -475,7 +464,7 @@ extern(Windows) int recv(SOCKET s, void* buf, int len, int flags) {
     WSABUF wsabuf = WSABUF(cast(uint)len, buf);
     auto sched = scheds.ptr + schedNum;
     auto statePtr = s in sched.ioWaiters;
-    statePtr.result = int.min;
+    *statePtr = IoState(int.min, null);
     int ret = WSARecv(s, &wsabuf, 1, null, cast(uint*)&flags, cast(LPWSAOVERLAPPED)&overlapped, null);
     logf("Got recv %d error: %d", ret, GetLastError());
     UmsThreadYield(statePtr);
