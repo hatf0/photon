@@ -121,6 +121,24 @@ extern(Windows) HANDLE CreateRemoteThreadEx(
   LPDWORD                      lpThreadId
 );
 
+extern(Windows) BOOL GetQueuedCompletionStatusEx(
+  HANDLE             CompletionPort,
+  OVERLAPPED_ENTRY*  lpCompletionPortEntries,
+  ULONG              ulCount,
+  PULONG             ulNumEntriesRemoved,
+  DWORD              dwMilliseconds,
+  BOOL               fAlertable
+);
+
+struct OVERLAPPED_ENTRY {
+  ULONG_PTR    lpCompletionKey;
+  LPOVERLAPPED lpOverlapped;
+  ULONG_PTR    Internal;
+  DWORD        dwNumberOfBytesTransferred;
+}
+
+
+
 enum STACK_SIZE_PARAM_IS_A_RESERVATION = 0x00010000;
 
 alias UmsSchedulerProc = extern(Windows) VOID function(UMS_SCHEDULER_REASON Reason, ULONG_PTR ActivationPayload, PVOID SchedulerParam);
@@ -380,18 +398,22 @@ extern(Windows) VOID umsScheduler(UMS_SCHEDULER_REASON Reason, ULONG_PTR Activat
       }
       auto wait = WaitForMultipleObjects(2, sched.handles.ptr, FALSE, INFINITE);
       if (wait == WAIT_OBJECT_0) {
-        OVERLAPPED* overlapped;
-        uint bytes;
-        SOCKET key;
-        while(GetQueuedCompletionStatus(sched.completionPort, &bytes, &key, &overlapped, 0)) {
-            logf("Dequeued I/O schedNum=%d key=%d len=%s", schedNum, key, bytes);
-            auto state = key in sched.ioWaiters;
-            state.result = cast(int)bytes;
-            if (state.ctx) { // got into yield before the check
-                sched.lock.lock();
-                queue.push(state.ctx);
-                sched.lock.unlock();
+        OVERLAPPED_ENTRY[100] entries = void;
+        uint count = 0;
+        for (;;) {
+            GetQueuedCompletionStatusEx(sched.completionPort, entries.ptr, 100, &count, 0, FALSE);
+            logf("Dequeued I/O schedNum=%d events=%d", schedNum, count);
+            foreach (e; entries[0..count]) {
+                size_t key = cast(size_t)e.lpCompletionKey;
+                auto state = key in sched.ioWaiters;
+                state.result = cast(int)e.bytes;
+                if (state.ctx) { // got into yield before the check
+                    sched.lock.lock();
+                    queue.push(state.ctx);
+                    sched.lock.unlock();
+                }
             }
+            if (count < 100) break;
         }
       }
     }
