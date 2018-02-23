@@ -3,6 +3,7 @@ module dfio_win;
 version(Windows):
 
 import core.sys.windows.core;
+import core.sys.windows.winsock2;
 import core.atomic;
 import core.internal.spinlock;
 import core.stdc.stdio;
@@ -89,6 +90,7 @@ extern(Windows) BOOL QueryUmsThreadInformation(
     ULONG                 UmsThreadInformationLength,
     PULONG                ReturnLength
 );
+extern(Windows) BOOL GetUmsCompletionListEvent(UMS_COMPLETION_LIST* UmsCompletionList, HANDLE* UmsCompletionEvent);
 
 extern(Windows) BOOL InitializeProcThreadAttributeList(
   PROC_THREAD_ATTRIBUTE_LIST* lpAttributeList,
@@ -153,18 +155,36 @@ struct RingQueue(T)
     bool empty(){ return size == 0; }
 }
 
+static struct IoState
+{
+    int result;
+    UMS_CONTEXT* ctx;
+}
+
 struct SchedulerBlock
 {
     AlignedSpinLock lock; // lock around the queue
     UMS_COMPLETION_LIST* completionList;
     RingQueue!(UMS_CONTEXT*) queue; // queue has the number of outstanding threads
-    shared uint assigned; // total assigned UMS threads
+    shared uint assigned; // total assigned UMS threads (counter, accessible everywhere)
+    IoState[SOCKET] ioWaiters; //used only in this UMS scheduler
+
+    union {
+        struct {
+            HANDLE completionPort;
+            HANDLE event;
+        }
+        HANDLE[2] handles;
+    }
 
     this(int size)
     {
         lock = AlignedSpinLock(SpinLock.Contention.brief);
         queue = RingQueue!(UMS_CONTEXT*)(size);
         wenforce(CreateUmsCompletionList(&completionList), "failed to create UMS completion");
+        wenforce(GetUmsCompletionListEvent(completionList, &event), "failed to get event for UMS queue");
+        completionPort = CreateIoCompletionPort(cast(HANDLE)INVALID_HANDLE_VALUE, null, 0, 1);
+        wenforce(completionPort != INVALID_HANDLE_VALUE, "failed to create I/O completion port");
     }
 }
 
@@ -175,6 +195,7 @@ size_t schedNum; // (TLS) number of scheduler
 struct Functor
 {
 	void delegate() func;
+    size_t schedNum;
 }
 
 void startloop()
@@ -190,6 +211,7 @@ void startloop()
 extern(Windows) uint worker(void* func)
 {
     auto functor = *cast(Functor*)func;
+    schedNum = functor.schedNum;
     functor.func();
     return 0;
 }
@@ -210,15 +232,18 @@ void spawn(void delegate() func)
     size_t b = uniform!"[)"(0, scheds.length);
     uint loadA = scheds[a].assigned; // take into account active queue.size?
     uint loadB = scheds[b].assigned; // ditto
-    if (loadA < loadB) atomicOp!"+="(scheds[a].assigned, 1);
-    else atomicOp!"+="(scheds[b].assigned, 1);
+    size_t choice;
+    if (loadA < loadB) choice = a;
+    else choice = b;
+    atomicOp!"+="(scheds[choice].assigned, 1);
     UMS_CREATE_THREAD_ATTRIBUTES umsAttrs;
-    umsAttrs.UmsCompletionList = loadA < loadB ? scheds[a].completionList : scheds[b].completionList;
+    umsAttrs.UmsCompletionList = scheds[choice].completionList;
     umsAttrs.UmsContext = ctx;
     umsAttrs.UmsVersion = UMS_VERSION;
 
+    auto fn = new Functor(func, choice);
     wenforce(UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_UMS_THREAD, &umsAttrs, umsAttrs.sizeof, null, null), "failed to update proc thread");
-    HANDLE handle = wenforce(CreateRemoteThreadEx(GetCurrentProcess(), null, 0, &worker, new Functor(func), 0, attrList, null), "failed to create thread");
+    HANDLE handle = wenforce(CreateRemoteThreadEx(GetCurrentProcess(), null, 0, &worker, fn, 0, attrList, null), "failed to create thread");
     atomicOp!"+="(activeThreads, 1);
 }
 
@@ -250,7 +275,15 @@ void outputToConsole(const(wchar)[] msg)
 void logf(T...)(const(wchar)[] fmt, T args)
 {
     debug try {
-        formattedWrite(&outputToConsole, fmt, args);
+        import std.algorithm.mutation;
+        wchar[256] buf = void;
+        wchar[] slice = buf[];
+        void writer(const(wchar)[] msg) {
+            slice = copy(msg, slice);
+        }
+        formattedWrite(&writer, fmt, args);
+        formattedWrite(&writer, "\n", args);
+        formattedWrite(&outputToConsole, buf[0 .. $ - slice.length]);
     }
     catch (Exception e) {
         outputToConsole("ARGH!"w);
@@ -267,38 +300,54 @@ void schedulerEntry(size_t n)
     info.SchedulerProc = &umsScheduler;
     info.SchedulerParam = null;
     wenforce(SetThreadAffinityMask(GetCurrentThread(), 1<<n), "failed to set affinity");
-    wenforce(EnterUmsSchedulingMode(&info), "failed to enter UMS mode\n");
+    wenforce(EnterUmsSchedulingMode(&info), "failed to enter UMS mode");
 }
 
 extern(Windows) VOID umsScheduler(UMS_SCHEDULER_REASON Reason, ULONG_PTR ActivationPayload, PVOID SchedulerParam)
 {
     UMS_CONTEXT* ready;
-    auto completionList = scheds[schedNum].completionList;
-       logf("-----\nGot scheduled, reason: %d, schedNum: %x\n"w, Reason, schedNum);
-    if(!DequeueUmsCompletionListItems(completionList, 0, &ready)){
-        logf("Failed to dequeue ums workers!\n"w);
-        return;
-    }    
+    SchedulerBlock* sched = scheds.ptr + schedNum;
+    auto completionList = sched.completionList;
+    if (Reason == 2) {
+        IoState* state = cast(IoState*)SchedulerParam;
+        auto ctx = cast(UMS_CONTEXT*)ActivationPayload;
+        logf("Got yield, schedNum: %d state = %s"w, schedNum, *state);
+        if (state.result != int.min) { // I/O already processed
+            sched.lock.lock();
+            auto queue = &sched.queue;
+            queue.push(ctx);
+            sched.lock.unlock();
+        }
+        else
+            state.ctx = ctx;
+    }
+    else if(Reason == 0) {
+        logf("Started scheduler schedNum: %d"w, schedNum);
+    }
     for (;;)
     {
-      scheds[schedNum].lock.lock();
-      auto queue = &scheds[schedNum].queue; // struct, so take a ref
+      if(!DequeueUmsCompletionListItems(completionList, 0, &ready)){
+        logf("Failed to dequeue ums workers!"w);
+        return;
+      }
+      sched.lock.lock();
+      auto queue = &sched.queue; // struct, so take a ref
       while (ready != null)
       {
-          logf("Dequeued UMS thread context: %x\n"w, ready);
+          //logf("Dequeued UMS thread context: %x"w, ready);
           queue.push(ready);
           ready = GetNextUmsListItem(ready);
       }
-      scheds[schedNum].lock.unlock();
+      sched.lock.unlock();
       while(!queue.empty)
       {
         UMS_CONTEXT* ctx = queue.pop;
-        logf("Fetched thread context from our queue: %x\n", ctx);
+        //logf("Fetched thread context from our queue: %x", ctx);
         BOOLEAN terminated;
         uint size;
         if(!QueryUmsThreadInformation(ctx, UMS_THREAD_INFO_CLASS.UmsThreadIsTerminated, &terminated, BOOLEAN.sizeof, &size))
         {
-            logf("Query UMS failed: %d\n"w, GetLastError());
+            logf("Query UMS failed: %d"w, GetLastError());
             return;
         }
         if (!terminated)
@@ -306,33 +355,107 @@ extern(Windows) VOID umsScheduler(UMS_SCHEDULER_REASON Reason, ULONG_PTR Activat
             auto ret = ExecuteUmsThread(ctx);
             if (ret == ERROR_RETRY) // this UMS thread is locked, try it later
             {
-                logf("Need retry!\n");
+                logf("Need retry!");
                 queue.push(ctx);
             }
             else
             {
-                logf("Failed to execute thread: %d\n"w, GetLastError());
+                logf("Failed to execute thread: %d"w, GetLastError());
                 return;
             }
         }
         else
         {
-            logf("Terminated: %x\n"w, ctx);
+            logf("Terminated: %x"w, ctx);
             //TODO: delete context or maybe cache them somewhere?
             DeleteUmsThreadContext(ctx);
-            atomicOp!"-="(scheds[schedNum].assigned, 1);
+            atomicOp!"-="(sched.assigned, 1);
             atomicOp!"-="(activeThreads, 1);
         }
       }
       if (activeThreads == 0)
       {
-          logf("Shutting down\n"w);
+          logf("Shutting down"w);
           return;
       }
-      if(!DequeueUmsCompletionListItems(completionList, INFINITE, &ready))
-      {
-           logf("Failed to dequeue UMS workers!\n"w);
-           return;
+      auto wait = WaitForMultipleObjects(2, sched.handles.ptr, FALSE, INFINITE);
+      if (wait == WAIT_OBJECT_0) {
+        OVERLAPPED* overlapped;
+        uint bytes;
+        SOCKET key;
+        while(GetQueuedCompletionStatus(sched.completionPort, &bytes, &key, &overlapped, 0)) {
+            logf("Dequeued I/O schedNum=%d key=%d len=%s", schedNum, key, bytes);
+            auto state = key in sched.ioWaiters;
+            state.result = cast(int)bytes;
+            if (state.ctx) { // got into yield before the check
+                sched.lock.lock();
+                queue.push(state.ctx);
+                sched.lock.unlock();
+            }
+        }
       }
     }
+}
+
+struct WSABUF 
+{
+    uint length;
+    void* buf;
+}
+
+extern(Windows) SOCKET WSASocketW(
+  int                af,
+  int                type,
+  int                protocol,
+  void*              lpProtocolInfo,
+  WORD               g,
+  DWORD              dwFlags
+);
+
+extern(Windows) int WSARecv(
+  SOCKET                             s,
+  WSABUF                             *lpBuffers,
+  DWORD                              dwBufferCount,
+  LPDWORD                            lpNumberOfBytesRecvd,
+  LPDWORD                            lpFlags,
+  LPWSAOVERLAPPED                    lpOverlapped,
+  LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine
+);
+
+extern(Windows) int WSASend(
+  SOCKET                             s,
+  WSABUF                             *lpBuffers,
+  DWORD                              dwBufferCount,
+  LPDWORD                            lpNumberOfBytesRecvd,
+  LPDWORD                            lpFlags,
+  LPWSAOVERLAPPED                    lpOverlapped,
+  LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine
+);
+
+enum WSA_FLAG_OVERLAPPED  =  0x01;
+
+extern(Windows) SOCKET socket(int af, int type, int protocol) {
+    logf("Intercepted socket!");
+    SOCKET s = WSASocketW(af, type, protocol, null, 0, WSA_FLAG_OVERLAPPED);
+    registerSocket(s);
+    return s;
+}
+
+void registerSocket(SOCKET s) {
+    auto sched = scheds.ptr + schedNum;
+    HANDLE port = sched.completionPort;
+    sched.ioWaiters[s] = IoState(int.min, null);
+    wenforce(CreateIoCompletionPort(cast(void*)s, port, cast(size_t)s, 0) == port, "failed to register I/O completion");
+}
+
+extern(Windows) int recv(SOCKET s, void* buf, int len, int flags) {
+    OVERLAPPED overlapped;
+    WSABUF wsabuf = WSABUF(cast(uint)len, buf);
+    auto sched = scheds.ptr + schedNum;
+    auto statePtr = s in sched.ioWaiters;
+    statePtr.result = int.min;
+    int ret = WSARecv(s, &wsabuf, 1, null, cast(uint*)&flags, cast(LPWSAOVERLAPPED)&overlapped, null);
+    logf("Got recv %d error: %d", ret, GetLastError());
+    UmsThreadYield(statePtr);
+    return statePtr.result;
 }

@@ -53,6 +53,7 @@ void writeDate(Output, D)(ref Output sink, D date){
 
 void server_worker(Socket client) {
     ubyte[1024] buffer;
+    registerSocket(client.handle);
     scope(exit) {
         client.shutdown(SocketShutdown.BOTH);
         client.close();
@@ -77,11 +78,11 @@ void server_worker(Socket client) {
     };
     do {
         reading = true;
-        while(reading){
+        while(reading) {
             ptrdiff_t received = client.receive(buffer);
             if (received < 0) {
                 logf("Error %d", received);
-                perror("Error while reading from client");
+                //perror("Error while reading from client");
                 return;
             }
             else if (received == 0) { //socket is closed (eof)
@@ -131,7 +132,14 @@ void server() {
     logf("Started server");
 
     void processClient(Socket client) {
-        spawn(() => server_worker(client));
+        spawn({
+            try {
+                server_worker(client);
+            }
+            catch(Exception e) {
+                logf("Exception %s", e);
+            }
+        });
     }
 
     while(true) {
@@ -148,7 +156,10 @@ void server() {
 }
 
 void main() {
-    version(Windows) GC.disable(); // temporary for Win64 UMS threading
+    version(Windows) {
+        import core.memory;
+        GC.disable(); // temporary for Win64 UMS threading
+    }
     startloop();
     spawn(() => server());
     runFibers();
