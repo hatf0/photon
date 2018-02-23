@@ -398,21 +398,21 @@ extern(Windows) VOID umsScheduler(UMS_SCHEDULER_REASON Reason, ULONG_PTR Activat
       }
       auto wait = WaitForMultipleObjects(2, sched.handles.ptr, FALSE, INFINITE);
       if (wait == WAIT_OBJECT_0) {
-        OVERLAPPED_ENTRY[100] entries = void;
-        uint count = 0;
         for (;;) {
+            OVERLAPPED_ENTRY[100] entries;
+            uint count = 0;
             GetQueuedCompletionStatusEx(sched.completionPort, entries.ptr, 100, &count, 0, FALSE);
             logf("Dequeued I/O schedNum=%d events=%d", schedNum, count);
+            sched.lock.lock();
             foreach (e; entries[0..count]) {
                 size_t key = cast(size_t)e.lpCompletionKey;
                 auto state = key in sched.ioWaiters;
-                state.result = cast(int)e.bytes;
+                state.result = cast(int)e.dwNumberOfBytesTransferred;
                 if (state.ctx) { // got into yield before the check
-                    sched.lock.lock();
                     queue.push(state.ctx);
-                    sched.lock.unlock();
                 }
             }
+            sched.lock.unlock();
             if (count < 100) break;
         }
       }

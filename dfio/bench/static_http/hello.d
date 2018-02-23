@@ -150,7 +150,7 @@ void server() {
             processClient(client);
         }
         catch(Exception e) {
-            writefln("Failure to accept %s", e);
+            logf("Failure to accept %s", e);
         }
     }
 }
