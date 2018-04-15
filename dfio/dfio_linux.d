@@ -646,10 +646,10 @@ void schedulerEntry(size_t n)
                 }
             }
             else {
-                if (cas(&event_loop_spin, 0, 1)) {
+                //if (cas(&event_loop_spin, 0, 1)) {
                     processEvents();
-                    atomicStore(event_loop_spin, 0);
-                }
+                  /*  atomicStore(event_loop_spin, 0);
+                }*/
             }
         }
     }
