@@ -77,29 +77,24 @@ version (X86) {
 
     size_t syscall(size_t ident) nothrow
     {
-        size_t ret;
-
         asm nothrow
         {
-            mov RAX, ident;
+            naked;
+            mov RAX, RDI;
             syscall;
-            mov ret, RAX;
+            ret;
         }
-        return ret;
     }
 
     size_t syscall(size_t ident, size_t n) nothrow
     {
-        size_t ret;
-
         asm nothrow
         {
-            mov RAX, ident;
-            mov RDI, n;
+            naked;
+            mov RAX, RSI;
             syscall;
-            mov ret, RAX;
+            ret;
         }
-        return ret;
     }
 
     size_t syscall(size_t ident, size_t n, size_t arg1, size_t arg2) nothrow
@@ -155,21 +150,17 @@ version (X86) {
 
     size_t syscall(size_t ident, size_t n, size_t arg1, size_t arg2, size_t arg3, size_t arg4, size_t arg5) nothrow
     {
-        size_t ret;
-
         asm nothrow
         {
-            mov RAX, ident;
-            mov RDI, n;
-            mov RSI, arg1;
-            mov RDX, arg2;
-            mov R10, arg3;
-            mov R8, arg4;
-            mov R9, arg5;
+            naked;
+            mov RAX, [RSP+0x8];
+            xchg RDI, R9;
+            xchg RSI, R8;
+            mov R10, RDX;
+            mov RDX, RCX;
             syscall;
-            mov ret, RAX;
+            ret;
         }
-        return ret;
     }
 }
 

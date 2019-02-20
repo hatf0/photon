@@ -1,13 +1,15 @@
 import std.stdio;
-import core.sys.posix.unistd : write, _exit;
 import core.sys.posix.sys.types;
 import std.socket;
 import core.stdc.errno;
 import core.sys.posix.sys.socket;
 import core.sys.posix.fcntl;
+import core.sys.posix.unistd;
 import core.thread;
 import core.sys.posix.stdlib: abort;
-import dfio;
+import photon;
+import photon.linux.support;
+import photon.linux.syscalls;
 
 void check(int code) {
     if(code < 0)
@@ -16,9 +18,10 @@ void check(int code) {
 
 // if this writes say 100 bytes total
 void writerReader(int fd1, int fd2) {
+    logf("TID=%d", gettid());
     logf("<started writerReader, fd1 = %d, fd2 = %d>", fd1, fd2);
     auto s = "simple read write\n";
-    write(fd1, s.ptr, s.length).checked;
+    send(fd1, s.ptr, s.length, 0).checked("wr: send");
 
     logf("<midway writerReader, fd1 = %d, fd2 = %d>", fd1, fd2);
 
@@ -26,8 +29,9 @@ void writerReader(int fd1, int fd2) {
     ssize_t total = 17;
     ssize_t bytes = 0;
     while(bytes < total) {
-        ssize_t resp = core.sys.posix.unistd.read(fd2, buf2.ptr + bytes, total - bytes).checked;
+        ssize_t resp = recv(fd2, buf2.ptr + bytes, total - bytes, 0);
         logf("read1 resp = %s", resp);
+        resp.checked("wr: recv");
         bytes += resp;
     }
 
@@ -36,13 +40,15 @@ void writerReader(int fd1, int fd2) {
 
 // it must read the exact same amount (in total) that would be 100 bytes
 void readerWriter(int fd1, int fd2) {
+    logf("TID=%d", gettid());
     logf("<started readerWriter, fd1 = %d, fd2 = %d>", fd1, fd2);
     char[100] buf;
     ssize_t total = 17;
     ssize_t bytes = 0;
     while(bytes < total) {
-        ssize_t resp = core.sys.posix.unistd.read(fd1, buf.ptr + bytes, total - bytes).checked;
+        ssize_t resp = recv(fd1, buf.ptr + bytes, total - bytes, 0);
         logf("read2 resp = %s", resp);
+        resp.checked("rw: recv");
         bytes += resp;
     }
 
@@ -50,13 +56,12 @@ void readerWriter(int fd1, int fd2) {
 
     auto s = "simple read write\n";
     char[] buf2 = s.dup;
-    write(fd2, s.ptr, s.length).checked;
+    send(fd2, s.ptr, s.length, 0).checked("rw: send");
     logf("<finished readerWriter>");
 }
 
 void main() {
     int[2] socks1, socks2;
-    startloop();
     check(socketpair(AF_UNIX, SOCK_STREAM, 0, socks1));
     check(socketpair(AF_UNIX, SOCK_STREAM, 0, socks2));
     logf("socks1 = %s", socks1);
@@ -67,8 +72,5 @@ void main() {
     wr.start();
 
     // spawn fiber to read stuff
-    spawn(() => readerWriter(socks1[1], socks2[1]));
-    runFibers();
-    //
-    wr.join();
+    new Thread(() => readerWriter(socks1[1], socks2[1])).start();
 }

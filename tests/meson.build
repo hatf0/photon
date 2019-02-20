@@ -10,6 +10,11 @@ executable('curl-download',
 	build_by_default: true
 )
 
+executable('ping_pong_full_duplex',
+	sources: ['ping_pong_full_duplex.d'],
+	dependencies: [photon_dep],
+	build_by_default: true)
+
 memcached_dep = declare_dependency(
 	link_args: '-lmemached'
 )
