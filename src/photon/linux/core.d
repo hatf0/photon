@@ -727,20 +727,23 @@ extern(C) ssize_t connect(int sockfd, const sockaddr *addr, socklen_t *addrlen)
         (sockfd, cast(size_t) addr, cast(size_t) addrlen);
 }
 
+
+extern(C) ssize_t send(int sockfd, const void *buf, size_t len, int flags)
+{
+    return universalSyscall!(SYS_SENDTO, "sendto", SyscallKind.write, Fcntl.msg, EWOULDBLOCK)
+        (sockfd, cast(size_t) buf, len, flags, 0, 0);
+}
+
+
 extern(C) ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
                       const sockaddr *dest_addr, socklen_t addrlen)
 {
-    return universalSyscall!(SYS_SENDTO, "sendto", SyscallKind.write, Fcntl.explicit, EWOULDBLOCK)
+    return universalSyscall!(SYS_SENDTO, "sendto", SyscallKind.write, Fcntl.msg, EWOULDBLOCK)
         (sockfd, cast(size_t) buf, len, flags, cast(size_t) dest_addr, cast(size_t) addrlen);
 }
 
 extern(C) size_t recv(int sockfd, void *buf, size_t len, int flags) nothrow {
-    sockaddr_in src_addr;
-    src_addr.sin_family = AF_INET;
-    src_addr.sin_port = 0;
-    src_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    ssize_t addrlen = sockaddr_in.sizeof;
-    return recvfrom(sockfd, buf, len, flags, cast(sockaddr*)&src_addr, &addrlen);   
+    return recvfrom(sockfd, buf, len, flags, null, null);   
 }
 
 extern(C) private ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
