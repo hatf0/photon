@@ -19,5 +19,4 @@ void runFibers()
     schedulerEntry(0);
     foreach (t; threads)
         t.join();
-    version(linux) stoploop();
 }
