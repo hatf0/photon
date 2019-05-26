@@ -110,22 +110,11 @@ nothrow:
     void scheduleAll(int wakeFd) nothrow
     {
         auto w = &this;
-        FiberExt head;
-        // first process all AwaitingFibers since they are on stack
         do {
-            auto fiber = w.fiber;
-            if (fiber) {
-                fiber.next = head;
-                head = fiber;
-            }
+            fiber.wakeFd = wakeFd;
+            fiber.schedule();
             w = w.next;
         } while(w);
-        while(head) {
-            logf("Waking with FD=%d", wakeFd);
-            head.wakeFd = wakeFd;
-            head.schedule();
-            head = head.next;
-        }
     }
 }
 
@@ -191,6 +180,7 @@ package(photon) void schedulerEntry(size_t n)
     // register queue event
     event.events = EPOLLIN;
     event.data.fd = sched.queue.event.fd;
+    logf("Scheduler event fd=%d", sched.queue.event.fd);
     epoll_ctl(event_loop_fd, EPOLL_CTL_ADD, event.data.fd, &event)
         .checked("registering event queue");
     
@@ -263,6 +253,7 @@ struct FdSide {
 nothrow:
     void enqueue(AwaitingFiber* await) {
         await.next = awaits;
+        awaits = await;
     }
 
     AwaitingFiber* remove(AwaitingFiber* fiber) {
@@ -270,7 +261,10 @@ nothrow:
     }
 
     void scheduleAll(int fd) {
-        if (awaits) awaits.scheduleAll(fd);
+        if (awaits) {
+            awaits.scheduleAll(fd);
+            awaits = null;
+        }
     }
 }
 
@@ -309,6 +303,8 @@ int processEvents(shared SchedulerBlock* sched, int event_loop_fd)
     for (int n = 0; n < r; n++) {
         int fd = events[n].data.fd;
         if (fd == termination.fd) return -1;
+        if (fd == sched.queue.event.fd)  // triggered on insert into empty run-queue
+            sched.queue.event.waitAndReset();
         auto descriptor = descriptors.ptr + fd;
         // if (descriptor.state == FdState.NONBLOCKING)
         if (events[n].events & EPOLLIN) {
@@ -392,9 +388,9 @@ ssize_t universalSyscall(size_t ident, string name, SyscallKind kind, Fcntl fcnt
         }
         logf("kind:s args:%s", kind, args);
         static if(kind == SyscallKind.accept || kind == SyscallKind.read) {
-            auto state = descriptor.reader.state;
-            logf("%s syscall state is %d. Fiber %x", name, state, cast(void*)currentFiber);
             for (;;) {
+                auto state = descriptor.reader.state;
+                logf("%s syscall state is %d. Fiber %x", name, state, cast(void*)currentFiber);
                 if (state == FdSideState.NOT_READY) {
                     descriptor.reader.enqueue(&await);
                     FiberExt.yield();
@@ -412,7 +408,10 @@ ssize_t universalSyscall(size_t ident, string name, SyscallKind kind, Fcntl fcnt
                             descriptor.reader.state = FdSideState.NOT_READY;
                     }
                     else static assert(false);
-                    return withErrorno(resp);
+                    if (resp == -EAGAIN || resp == -ERR) {
+                        descriptor.reader.state = FdSideState.NOT_READY;
+                    }
+                    else return withErrorno(resp);
                 }
             }
         }
@@ -428,7 +427,10 @@ ssize_t universalSyscall(size_t ident, string name, SyscallKind kind, Fcntl fcnt
                         descriptor.writer.state = FdSideState.UNCERTAIN;
                     else if (resp >= 0)
                         descriptor.writer.state = FdSideState.NOT_READY;
-                    return withErrorno(resp);
+                    else if(resp == -EAGAIN || resp == -ERR) {
+                        descriptor.writer.state = FdSideState.NOT_READY;
+                    }
+                    else return withErrorno(resp);
                 }
             }
         }
@@ -483,7 +485,7 @@ extern(C) size_t recv(int sockfd, void *buf, size_t len, int flags) nothrow {
     src_addr.sin_port = 0;
     src_addr.sin_addr.s_addr = htonl(INADDR_ANY);
     ssize_t addrlen = sockaddr_in.sizeof;
-    return recvfrom(sockfd, buf, len, flags, cast(sockaddr*)&src_addr, &addrlen);   
+    return recvfrom(sockfd, buf, len, flags, cast(sockaddr*)&src_addr, &addrlen);
 }
 
 extern(C) private ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
