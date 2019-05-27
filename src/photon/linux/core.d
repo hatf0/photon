@@ -1,33 +1,29 @@
 module photon.linux.core;
 private:
 
-import std.stdio;
-import std.string;
-import std.exception;
-import std.conv;
-import std.array;
-import core.thread;
-import core.internal.spinlock;
-import core.sys.posix.sys.types;
-import core.sys.posix.sys.socket;
-import core.sys.posix.poll;
-import core.sys.posix.netinet.in_;
-import core.sys.posix.unistd;
-import core.sys.linux.epoll;
-import core.sys.linux.timerfd;
-import core.stdc.errno;
 import core.atomic;
-import core.sys.posix.stdlib: abort;
-import core.sys.posix.fcntl;
+import core.internal.spinlock;
 import core.memory;
-import core.sys.posix.sys.mman;
-import core.sys.posix.pthread;
+import core.stdc.errno;
+import core.stdc.stdio;
+import core.sys.linux.epoll;
 import core.sys.linux.sys.signalfd;
+import core.sys.linux.timerfd;
+import core.sys.posix.fcntl;
+import core.sys.posix.netinet.in_;
+import core.sys.posix.poll;
+import core.sys.posix.pthread;
+import core.sys.posix.stdlib: abort;
+import core.sys.posix.sys.mman;
+import core.sys.posix.sys.socket;
+import core.sys.posix.sys.types;
+import core.sys.posix.unistd;
+import core.thread;
 
-import photon.linux.support;
-import photon.linux.syscalls;
 import photon.ds.common;
 import photon.ds.intrusive_queue;
+import photon.linux.support;
+import photon.linux.syscalls;
 
 
 shared struct RawEvent {
@@ -106,13 +102,11 @@ Timer timer() nothrow {
 struct AwaitingFiber {
     FiberExt fiber;
     AwaitingFiber* next;
-nothrow:
-    void scheduleAll(int wakeFd) nothrow
-    {
+
+    void scheduleAll() nothrow {
         auto w = &this;
         do {
-            fiber.wakeFd = wakeFd;
-            fiber.schedule();
+            fiber.scheduleLocal();
             w = w.next;
         } while(w);
     }
@@ -121,25 +115,30 @@ nothrow:
 class FiberExt : Fiber { 
     FiberExt next;
     uint numScheduler;
-    int wakeFd; // recieves fd that woken us up
     bool scheduled;
     enum PAGESIZE = 4096;
-
 nothrow:
-    this(void function() fn, uint numSched) nothrow {
+
+    this(void function() fn, uint numSched) {
         super(fn);
         numScheduler = numSched;
     }
 
-    this(void delegate() dg, uint numSched) nothrow {
+    this(void delegate() dg, uint numSched) {
         super(dg);
         numScheduler = numSched;
     }
 
-    void schedule() nothrow
-    {
+    void schedule() {
         if(!scheduled) {
             scheds[numScheduler].queue.push(this);
+            scheduled = true;
+        }
+    }
+
+    void scheduleLocal() {
+        if(!scheduled) {
+            scheds[numScheduler].queue.pushLocal(this);
             scheduled = true;
         }
     }
@@ -150,9 +149,8 @@ shared RawEvent termination; // termination event, triggered once last fiber exi
 shared int alive; // count of non-terminated Fibers scheduled
 
 struct SchedulerBlock {
-    shared IntrusiveQueue!(FiberExt, RawEvent) queue;
+    shared HybridIntrusiveQueue!(FiberExt, RawEvent, SpinLock) queue;
     shared uint assigned;
-    size_t[2] padding;
 }
 
 static assert(SchedulerBlock.sizeof == 64);
@@ -188,10 +186,11 @@ package(photon) void schedulerEntry(size_t n)
     descriptors = (cast(Descriptor*) mmap(null, fdMax * Descriptor.sizeof, 
         PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0)
     )[0..fdMax];
-
     while (alive > 0) {
         for(;;) {
-            FiberExt f = sched.queue.drain();
+            IntrusiveQueue!FiberExt runList;
+            sched.queue.drain(runList);
+            FiberExt f = runList.head;
             if (f is null) break; // drained an empty queue, time to poll events
             do {
                 auto next = f.next; // save next, it will be reused on scheduling
@@ -202,7 +201,8 @@ package(photon) void schedulerEntry(size_t n)
                     f.call();
                 }
                 catch (Exception e) {
-                    stderr.writeln(e);
+                    string s = e.toString;
+                    fprintf(stderr, "%.*s\n", s.length, s.ptr);
                     atomicOp!"-="(alive, 1);
                 }
                 if (f.state == FiberExt.State.TERM) {
@@ -260,9 +260,9 @@ nothrow:
         return removeFromList(awaits, fiber);
     }
 
-    void scheduleAll(int fd) {
+    void scheduleAll() {
         if (awaits) {
-            awaits.scheduleAll(fd);
+            awaits.scheduleAll();
             awaits = null;
         }
     }
@@ -288,7 +288,8 @@ public void startloop()
     uint threads = threadsPerCPU;
     scheds = new SchedulerBlock[threads];
     foreach(ref sched; scheds) {
-        sched.queue = IntrusiveQueue!(FiberExt, RawEvent)(RawEvent(0));
+        sched.queue = HybridIntrusiveQueue!(FiberExt, RawEvent, SpinLock)
+            (RawEvent(0), SpinLock(SpinLock.Contention.brief));
     }
 }
 
@@ -311,13 +312,13 @@ int processEvents(shared SchedulerBlock* sched, int event_loop_fd)
             logf("Read event for fd=%d", fd);
             logf("read state = %d", descriptor.reader.state);
             descriptor.reader.state = FdSideState.READY;
-            descriptor.reader.scheduleAll(fd);
+            descriptor.reader.scheduleAll();
         }
         if (events[n].events & EPOLLOUT) {
             logf("Write event for fd=%d", fd);
             logf("write state = %d", descriptor.writer.state);
             descriptor.writer.state = FdSideState.READY;
-            descriptor.writer.scheduleAll(fd);                      
+            descriptor.writer.scheduleAll();                      
         }
     }
     return r;
@@ -358,9 +359,9 @@ void deregisterFd(int fd) nothrow {
     if(fd >= 0 && fd < descriptors.length) {
         auto descriptor = descriptors.ptr + fd;
         descriptor.state = FdState.UNINITIALIZED;
-        descriptor.writer.scheduleAll(fd);
+        descriptor.writer.scheduleAll();
         descriptor.writer.state = FdSideState.NOT_READY;
-        descriptor.reader.scheduleAll(fd);
+        descriptor.reader.scheduleAll();
         descriptor.reader.state = FdSideState.NOT_READY;
     }
 }
