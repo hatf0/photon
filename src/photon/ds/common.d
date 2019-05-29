@@ -21,12 +21,14 @@ interface WorkQueue(T) {
 
 // intrusive list helper
 T removeFromList(T)(T head, T item) {
-	if (head == item) return head.next;
+	if (head is item) return head.next;
 	else {
 		auto p = head;
 		while(p.next) {
-			if (p.next == item)
+			if (p.next is item) {
 				p.next = item.next;
+				break;
+			}
 			else 
 				p = p.next;
 		}
