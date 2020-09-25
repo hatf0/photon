@@ -42,3 +42,5 @@ Thumbs.db
 
 # Datafiles from benchmarks
 *.csv
+
+build/

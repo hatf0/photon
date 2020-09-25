@@ -1,3 +1,0 @@
-[submodule "3rd-party/http-parser"]
-	path = 3rd-party/http-parser
-	url = https://github.com/DmitryOlshansky/http-parser.git
